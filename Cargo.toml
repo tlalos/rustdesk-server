@@ -18,6 +18,10 @@ path = "src/utils.rs"
 
 [dependencies]
 hbb_common = { path = "libs/hbb_common" }
+# Vendored OpenSSL: openssl-sys is pulled transitively (hbb_common's reqwest native-tls); the
+# musl cross image ships no musl OpenSSL to link against, so build it from source. Enables a
+# reproducible static musl build (matches the busybox/s6 runtime image) without a system libssl.
+openssl = { version = "0.10", features = ["vendored"] }
 serde_derive = "1.0"
 serde = "1.0"
 serde_json = "1.0"
