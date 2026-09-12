@@ -13,7 +13,7 @@ use hbb_common::{
     tokio::{
         self,
         io::{AsyncReadExt, AsyncWriteExt},
-        net::{TcpListener, TcpStream},
+        net::{TcpListener, TcpStream, UdpSocket},
         sync::{Mutex, RwLock},
         time::{interval, Duration},
     },
@@ -24,8 +24,10 @@ use std::{
     collections::{HashMap, HashSet},
     io::prelude::*,
     io::Error,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     sync::atomic::{AtomicUsize, Ordering},
+    sync::Arc,
+    time::Instant,
 };
 
 type Usage = (usize, usize, usize, usize);
@@ -35,7 +37,17 @@ lazy_static::lazy_static! {
     static ref USAGE: RwLock<HashMap<String, Usage>> = Default::default();
     static ref BLACKLIST: RwLock<HashSet<String>> = Default::default();
     static ref BLOCKLIST: RwLock<HashSet<String>> = Default::default();
+    // UDP relay (ViewDesk VPN raw-UDP data plane). A peer awaiting its partner: uuid -> (its source
+    // addr, when registered). Once both sides of a uuid have sent a RequestRelay, they are paired.
+    static ref UDP_PENDING: Mutex<HashMap<String, (SocketAddr, Instant)>> = Default::default();
+    // Established forwarding routes: source addr -> (partner addr, last-activity). A datagram from a
+    // known source is forwarded verbatim to its partner (payloads are end-to-end AEAD -- the relay
+    // never sees plaintext). Idle routes are garbage-collected.
+    static ref UDP_ROUTES: Mutex<HashMap<SocketAddr, (SocketAddr, Instant)>> = Default::default();
 }
+
+/// Idle timeout for a UDP relay route / pending registration (seconds).
+const UDP_RELAY_IDLE_SECS: u64 = 60;
 
 static DOWNGRADE_THRESHOLD_100: AtomicUsize = AtomicUsize::new(66); // 0.66
 static DOWNGRADE_START_CHECK: AtomicUsize = AtomicUsize::new(1_800_000); // in ms
@@ -86,6 +98,20 @@ pub async fn start_with_bind(
     log::info!("Listening on tcp :{}", port);
     let port2 = port + 2;
     log::info!("Listening on websocket :{}", port2);
+    // UDP relay (ViewDesk VPN raw-UDP data plane) on the same relay port, UDP. Independent of the
+    // TCP relay; forwards opaque AEAD datagrams between two peers paired by uuid.
+    {
+        let bind_ip: IpAddr = bind_addr.unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        match UdpSocket::bind(SocketAddr::new(bind_ip, port)).await {
+            Ok(udp) => {
+                log::info!("Listening on udp :{} (VPN relay)", port);
+                let udp = Arc::new(udp);
+                let key_udp = key.clone();
+                tokio::spawn(async move { udp_relay_loop(udp, key_udp).await });
+            }
+            Err(e) => log::error!("Failed to bind UDP relay :{port}: {e}"),
+        }
+    }
     let main_task = async move {
         loop {
             log::info!("Start");
@@ -599,6 +625,74 @@ async fn relay(
         }
     }
     Ok(())
+}
+
+// UDP relay forwarder for the ViewDesk VPN raw-UDP data plane. A dumb datagram pump: peers are
+// paired by the `uuid` in an initial RequestRelay datagram (same message the TCP relay uses), then
+// every datagram from one paired source is forwarded verbatim to the other. Payloads are
+// end-to-end AEAD-encrypted by the peers, so the relay only ever handles ciphertext.
+async fn udp_relay_loop(sock: Arc<UdpSocket>, key: String) {
+    let mut buf = vec![0u8; 2048];
+    let mut last_gc = Instant::now();
+    loop {
+        match sock.recv_from(&mut buf).await {
+            Ok((n, src)) => {
+                // Fast path: a datagram from an already-paired source -> forward to its partner.
+                let dst = {
+                    let mut routes = UDP_ROUTES.lock().await;
+                    if let Some(entry) = routes.get_mut(&src) {
+                        entry.1 = Instant::now();
+                        Some(entry.0)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(dst) = dst {
+                    let _ = sock.send_to(&buf[..n], dst).await;
+                } else if let Ok(msg) = RendezvousMessage::parse_from_bytes(&buf[..n]) {
+                    // Unknown source: only a RequestRelay (registration) is accepted.
+                    if let Some(rendezvous_message::Union::RequestRelay(rf)) = msg.union {
+                        if (!key.is_empty() && rf.licence_key != key) || rf.uuid.is_empty() {
+                            if !key.is_empty() && rf.licence_key != key {
+                                log::warn!("UDP relay auth failed from {}", src);
+                            }
+                        } else {
+                            let mut pend = UDP_PENDING.lock().await;
+                            match pend.remove(&rf.uuid) {
+                                Some((other, _)) if other != src => {
+                                    let mut routes = UDP_ROUTES.lock().await;
+                                    let now = Instant::now();
+                                    routes.insert(src, (other, now));
+                                    routes.insert(other, (src, now));
+                                    log::info!("UDP relay paired {} <-> {} ({})", src, other, rf.uuid);
+                                }
+                                _ => {
+                                    pend.insert(rf.uuid.clone(), (src, Instant::now()));
+                                    log::info!("UDP relay pending {} from {}", rf.uuid, src);
+                                }
+                            }
+                        }
+                    }
+                }
+                // Periodic GC of idle routes / stale pending registrations.
+                if last_gc.elapsed().as_secs() >= 15 {
+                    last_gc = Instant::now();
+                    UDP_ROUTES
+                        .lock()
+                        .await
+                        .retain(|_, (_, t)| t.elapsed().as_secs() < UDP_RELAY_IDLE_SECS);
+                    UDP_PENDING
+                        .lock()
+                        .await
+                        .retain(|_, (_, t)| t.elapsed().as_secs() < UDP_RELAY_IDLE_SECS);
+                }
+            }
+            Err(e) => {
+                log::error!("UDP relay recv error: {}", e);
+                sleep(1.).await;
+            }
+        }
+    }
 }
 
 fn get_server_sk(key: &str) -> String {
