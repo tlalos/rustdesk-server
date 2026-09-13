@@ -39,11 +39,13 @@ lazy_static::lazy_static! {
     static ref BLOCKLIST: RwLock<HashSet<String>> = Default::default();
     // UDP relay (ViewDesk VPN raw-UDP data plane). A peer awaiting its partner: uuid -> (its source
     // addr, when registered). Once both sides of a uuid have sent a RequestRelay, they are paired.
-    static ref UDP_PENDING: Mutex<HashMap<String, (SocketAddr, Instant)>> = Default::default();
+    // std (sync) Mutex, not tokio: the per-datagram critical section is a tiny map lookup with no
+    // .await, so a synchronous lock avoids an async yield on the relay's hot forwarding path.
+    static ref UDP_PENDING: std::sync::Mutex<HashMap<String, (SocketAddr, Instant)>> = Default::default();
     // Established forwarding routes: source addr -> (partner addr, last-activity). A datagram from a
     // known source is forwarded verbatim to its partner (payloads are end-to-end AEAD -- the relay
     // never sees plaintext). Idle routes are garbage-collected.
-    static ref UDP_ROUTES: Mutex<HashMap<SocketAddr, (SocketAddr, Instant)>> = Default::default();
+    static ref UDP_ROUTES: std::sync::Mutex<HashMap<SocketAddr, (SocketAddr, Instant)>> = Default::default();
 }
 
 /// Idle timeout for a UDP relay route / pending registration (seconds).
@@ -105,6 +107,20 @@ pub async fn start_with_bind(
         match UdpSocket::bind(SocketAddr::new(bind_ip, port)).await {
             Ok(udp) => {
                 log::info!("Listening on udp :{} (VPN relay)", port);
+                // Enlarge the kernel socket buffers so an RDP/bulk burst forwarded through the relay
+                // doesn't overflow the small default (~208KB) recv buffer and silently drop
+                // datagrams (which shows up as tunnel loss/choke for BOTH paired peers). Best-effort:
+                // the kernel clamps to net.core.rmem_max / wmem_max, so raise those sysctls on the
+                // relay host to benefit fully.
+                {
+                    let sref = socket2::SockRef::from(&udp);
+                    if let Err(e) = sref.set_recv_buffer_size(16 * 1024 * 1024) {
+                        log::warn!("UDP relay: set_recv_buffer_size failed: {e}");
+                    }
+                    if let Err(e) = sref.set_send_buffer_size(16 * 1024 * 1024) {
+                        log::warn!("UDP relay: set_send_buffer_size failed: {e}");
+                    }
+                }
                 let udp = Arc::new(udp);
                 let key_udp = key.clone();
                 tokio::spawn(async move { udp_relay_loop(udp, key_udp).await });
@@ -639,7 +655,7 @@ async fn udp_relay_loop(sock: Arc<UdpSocket>, key: String) {
             Ok((n, src)) => {
                 // Fast path: a datagram from an already-paired source -> forward to its partner.
                 let dst = {
-                    let mut routes = UDP_ROUTES.lock().await;
+                    let mut routes = UDP_ROUTES.lock().unwrap();
                     if let Some(entry) = routes.get_mut(&src) {
                         entry.1 = Instant::now();
                         Some(entry.0)
@@ -648,7 +664,13 @@ async fn udp_relay_loop(sock: Arc<UdpSocket>, key: String) {
                     }
                 };
                 if let Some(dst) = dst {
-                    let _ = sock.send_to(&buf[..n], dst).await;
+                    // Non-blocking forward: never let a momentarily backed-up send buffer stall the
+                    // recv loop -- that stall would overflow the kernel recv buffer and drop EVERY
+                    // peer's datagrams (head-of-line blocking the whole relay). A drop here is just
+                    // link loss to the paired peers, handled by their inner TCP; far cheaper than
+                    // wedging the forwarder. try_send_to returns WouldBlock (dropped) only when the
+                    // enlarged send buffer is genuinely full.
+                    let _ = sock.try_send_to(&buf[..n], dst);
                 } else if let Ok(msg) = RendezvousMessage::parse_from_bytes(&buf[..n]) {
                     // Unknown source: only a RequestRelay (registration) is accepted.
                     if let Some(rendezvous_message::Union::RequestRelay(rf)) = msg.union {
@@ -657,10 +679,10 @@ async fn udp_relay_loop(sock: Arc<UdpSocket>, key: String) {
                                 log::warn!("UDP relay auth failed from {}", src);
                             }
                         } else {
-                            let mut pend = UDP_PENDING.lock().await;
+                            let mut pend = UDP_PENDING.lock().unwrap();
                             match pend.remove(&rf.uuid) {
                                 Some((other, _)) if other != src => {
-                                    let mut routes = UDP_ROUTES.lock().await;
+                                    let mut routes = UDP_ROUTES.lock().unwrap();
                                     let now = Instant::now();
                                     routes.insert(src, (other, now));
                                     routes.insert(other, (src, now));
@@ -679,11 +701,11 @@ async fn udp_relay_loop(sock: Arc<UdpSocket>, key: String) {
                     last_gc = Instant::now();
                     UDP_ROUTES
                         .lock()
-                        .await
+                        .unwrap()
                         .retain(|_, (_, t)| t.elapsed().as_secs() < UDP_RELAY_IDLE_SECS);
                     UDP_PENDING
                         .lock()
-                        .await
+                        .unwrap()
                         .retain(|_, (_, t)| t.elapsed().as_secs() < UDP_RELAY_IDLE_SECS);
                 }
             }
